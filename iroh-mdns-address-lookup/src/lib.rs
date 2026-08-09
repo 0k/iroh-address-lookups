@@ -55,7 +55,7 @@
 //! [`RelayUrl`]: iroh_base::RelayUrl
 use std::{
     collections::{BTreeSet, HashMap},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
 };
@@ -519,10 +519,32 @@ impl MdnsAddressLookup {
         let endpoint_id_str = data_encoding::BASE32_NOPAD
             .encode(endpoint_id.as_bytes())
             .to_ascii_lowercase();
+        // Pin one multicast send socket per eligible IPv4 interface.
+        //
+        // Without this, swarm-discovery creates a single `0.0.0.0:5353`
+        // socket and `send_to(224.0.0.251)` lets the kernel default route
+        // choose the egress interface.  On a host running a TUN-based VPN
+        // (sing-box, tailscale, wireguard) that route is the TUN device,
+        // so mDNS never reaches the real LAN and same-LAN peers never
+        // discover each other.  Tracks upstream n0-computer/iroh#3533.
+        //
+        // An EMPTY selection is deliberately left as-is rather than being
+        // treated as an error: swarm-discovery then falls back to its
+        // single wildcard socket, i.e. exactly the upstream behaviour.
+        // Failing closed here would make a host with no eligible LAN
+        // interface lose discovery entirely, which is strictly worse than
+        // the status quo it would be replacing.
+        let multicast_interfaces_v4 = host_multicast_candidate_v4s();
+        debug!(
+            ?multicast_interfaces_v4,
+            "mdns: pinning multicast send sockets to these interfaces"
+        );
+
         let mut discoverer = Discoverer::new_interactive(service_name, endpoint_id_str)
             .with_cadence(cadence)
             .with_callback(callback)
-            .with_ip_class(IpClass::Auto);
+            .with_ip_class(IpClass::Auto)
+            .with_multicast_interfaces_v4(multicast_interfaces_v4);
         if advertise {
             let addrs = MdnsAddressLookup::socketaddrs_to_addrs(socketaddrs.iter());
             for addr in addrs {
@@ -575,6 +597,82 @@ fn cache_discovery(
         .is_none_or(|old| old.endpoint_info() != item.endpoint_info());
     cache.insert(id, item);
     changed
+}
+
+/// One host interface, reduced to what the multicast policy actually needs.
+///
+/// Decoupling the policy from `netdev::Interface` keeps
+/// [`select_multicast_candidate_v4s`] a pure function over plain data, so
+/// the selection rules can be unit-tested without a live network stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterfaceSnapshot {
+    /// Interface is up and operational.
+    pub running: bool,
+    /// Interface is a loopback device.
+    pub loopback: bool,
+    /// Interface is a TUN/tunnel device (VPNs: sing-box, tailscale, wireguard).
+    pub tunnel: bool,
+    /// Interface is a virtual bridge / veth (docker, libvirt, podman).
+    pub virtual_: bool,
+    /// The interface's IPv4 addresses.
+    pub ipv4: Vec<Ipv4Addr>,
+}
+
+/// Selects the IPv4 addresses that should carry mDNS multicast.
+///
+/// An interface qualifies when it is running, is neither loopback nor a
+/// tunnel, and carries at least one routable IPv4 address.
+///
+/// Tunnels are excluded because they are the bug this whole selection
+/// exists to fix: a TUN device commonly holds the default route, which is
+/// precisely why the kernel's own choice of egress interface is wrong.
+///
+/// Loopback is excluded because pinning `127.0.0.1` does not help
+/// same-host discovery: swarm-discovery already reaches same-host peers
+/// through multicast loopback on the pinned physical interfaces.
+///
+/// Docker/libvirt/podman bridges and `veth` pairs are excluded too: they
+/// never reach another host, and pinning a socket to each of a dozen dead
+/// bridges destabilises discovery badly enough to break same-host
+/// resolution.
+pub(crate) fn select_multicast_candidate_v4s<I>(interfaces: I) -> Vec<Ipv4Addr>
+where
+    I: IntoIterator<Item = InterfaceSnapshot>,
+{
+    let mut seen = BTreeSet::new();
+    interfaces
+        .into_iter()
+        .filter(|iface| iface.running && !iface.loopback && !iface.tunnel && !iface.virtual_)
+        .flat_map(|iface| iface.ipv4)
+        .filter(|ip| {
+            !ip.is_unspecified() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_broadcast()
+        })
+        // Two interfaces can report the same address; pinning a socket
+        // twice to one address is pointless and confuses diagnostics.
+        .filter(|ip| seen.insert(*ip))
+        .collect()
+}
+
+/// Enumerates the host's interfaces and applies [`select_multicast_candidate_v4s`].
+///
+/// This is the only part of the multicast policy that touches the OS, and
+/// it holds no logic of its own beyond the `netdev` -> [`InterfaceSnapshot`]
+/// translation.
+fn host_multicast_candidate_v4s() -> Vec<Ipv4Addr> {
+    select_multicast_candidate_v4s(netdev::get_interfaces().into_iter().map(|iface| {
+        InterfaceSnapshot {
+            running: iface.is_running(),
+            loopback: iface.is_loopback(),
+            tunnel: iface.is_tun()
+                || iface.if_type == netdev::interface::types::InterfaceType::Tunnel,
+            virtual_: iface.if_type == netdev::interface::types::InterfaceType::Bridge
+                || iface.name.starts_with("br-")
+                || iface.name.starts_with("docker")
+                || iface.name.starts_with("veth")
+                || iface.name.starts_with("virbr"),
+            ipv4: iface.ipv4.iter().map(|net| net.addr()).collect(),
+        }
+    }))
 }
 
 fn peer_to_discovery_item(peer: &Peer, endpoint_id: &EndpointId) -> AddressLookupItem {
@@ -735,6 +833,148 @@ mod tests {
             lookup_duration(Duration::from_secs(60)),
             Duration::from_secs(77)
         );
+    }
+    /// Multicast interface selection policy.
+    ///
+    /// These tests are pure: they run against constructed
+    /// [`InterfaceSnapshot`] values and never touch the host's network
+    /// stack, so they assert the POLICY rather than whatever interfaces
+    /// the machine running the suite happens to have.
+    mod multicast_selection {
+        use std::net::Ipv4Addr;
+
+        use super::super::{InterfaceSnapshot, select_multicast_candidate_v4s};
+
+        /// A plain running physical interface with one address.
+        fn physical(ip: &str) -> InterfaceSnapshot {
+            InterfaceSnapshot {
+                running: true,
+                loopback: false,
+                tunnel: false,
+                virtual_: false,
+                ipv4: vec![ip.parse().unwrap()],
+            }
+        }
+
+        fn ips(v: &[&str]) -> Vec<Ipv4Addr> {
+            v.iter().map(|s| s.parse().unwrap()).collect()
+        }
+
+        #[test]
+        fn selects_running_physical_interfaces() {
+            let got = select_multicast_candidate_v4s([physical("192.0.2.10")]);
+            assert_eq!(got, ips(&["192.0.2.10"]));
+        }
+
+        #[test]
+        fn keeps_every_eligible_interface_on_a_multi_homed_host() {
+            // The whole point of the patch: a multi-homed host must send on
+            // ALL real interfaces, not just whichever one holds the default
+            // route.
+            let got =
+                select_multicast_candidate_v4s([physical("192.0.2.10"), physical("198.51.100.70")]);
+            assert_eq!(got, ips(&["192.0.2.10", "198.51.100.70"]));
+        }
+
+        #[test]
+        fn skips_interfaces_that_are_down() {
+            let mut down = physical("192.0.2.10");
+            down.running = false;
+            assert!(select_multicast_candidate_v4s([down]).is_empty());
+        }
+
+        #[test]
+        fn skips_loopback_interfaces() {
+            let mut lo = physical("127.0.0.1");
+            lo.loopback = true;
+            assert!(select_multicast_candidate_v4s([lo]).is_empty());
+        }
+
+        #[test]
+        fn skips_tunnel_interfaces() {
+            // A VPN (wireguard / sing-box / tailscale) commonly holds the
+            // default route.  Pinning it is exactly the bug being fixed, so
+            // it must never be selected even though it is up and routable.
+            let mut vpn = physical("203.0.113.116");
+            vpn.tunnel = true;
+            assert!(select_multicast_candidate_v4s([vpn]).is_empty());
+        }
+
+        #[test]
+        fn skips_virtual_bridges() {
+            // Docker/libvirt bridges are up and carry routable-looking
+            // addresses, but pinning a socket to each of them floods mDNS
+            // across a dozen dead networks and destabilises discovery.
+            let mut bridge = physical("172.17.0.1");
+            bridge.virtual_ = true;
+            assert!(select_multicast_candidate_v4s([bridge]).is_empty());
+        }
+
+        #[test]
+        fn skips_unroutable_addresses() {
+            let odd = InterfaceSnapshot {
+                running: true,
+                loopback: false,
+                tunnel: false,
+                virtual_: false,
+                ipv4: ips(&["0.0.0.0", "169.254.3.4", "255.255.255.255", "127.0.0.1"]),
+            };
+            assert!(select_multicast_candidate_v4s([odd]).is_empty());
+        }
+
+        #[test]
+        fn deduplicates_addresses_shared_by_several_interfaces() {
+            let got =
+                select_multicast_candidate_v4s([physical("192.0.2.10"), physical("192.0.2.10")]);
+            assert_eq!(got, ips(&["192.0.2.10"]));
+        }
+
+        #[test]
+        fn empty_host_yields_empty_selection() {
+            // An empty selection is meaningful, not an error: swarm-discovery
+            // falls back to its single wildcard socket, i.e. stock upstream
+            // behaviour.  Asserted so the fallback stays a decision rather
+            // than an accident.
+            assert!(select_multicast_candidate_v4s([]).is_empty());
+        }
+
+        #[test]
+        fn keeps_multiple_addresses_from_one_interface() {
+            let multi = InterfaceSnapshot {
+                running: true,
+                loopback: false,
+                tunnel: false,
+                virtual_: false,
+                ipv4: ips(&["192.0.2.10", "192.0.2.11"]),
+            };
+            assert_eq!(
+                select_multicast_candidate_v4s([multi]),
+                ips(&["192.0.2.10", "192.0.2.11"])
+            );
+        }
+
+        #[test]
+        fn realistic_host_selects_only_the_lan_interface() {
+            // Mirrors the development host: one LAN NIC, one wireguard VPN
+            // holding the default route, several docker bridges, loopback.
+            let mut lo = physical("127.0.0.1");
+            lo.loopback = true;
+            let mut vpn = physical("203.0.113.116");
+            vpn.tunnel = true;
+            let mut bridge_a = physical("172.17.0.1");
+            bridge_a.virtual_ = true;
+            let mut bridge_b = physical("172.18.0.1");
+            bridge_b.virtual_ = true;
+
+            let got = select_multicast_candidate_v4s([
+                lo,
+                vpn,
+                bridge_a,
+                bridge_b,
+                physical("198.51.100.70"),
+            ]);
+            assert_eq!(got, ips(&["198.51.100.70"]));
+        }
     }
 
     /// This module's name signals nextest to run test in a single thread (no other concurrent
