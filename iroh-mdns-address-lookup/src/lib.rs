@@ -56,6 +56,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
     str::FromStr,
     sync::Arc,
 };
@@ -688,6 +689,22 @@ where
         .collect()
 }
 
+/// Where Linux exposes one directory per network interface.
+const SYSFS_NET: &str = "/sys/class/net";
+
+/// Whether the interface `name` is host-local container/VM plumbing: a
+/// bridge (`docker0`, `br-*`, `lxcbr0`, `virbr0`, ...) or a `veth`.
+///
+/// A bridge is recognised by the kernel, not by its name: it has a `bridge`
+/// directory under `sysfs_net` (only on Linux; elsewhere the directory never
+/// exists).  A `veth` is recognised by its name, which every container
+/// runtime gives it.  The interface holding the default route is never
+/// host-local, so a host whose uplink is itself a bridge (`br0` enslaving the
+/// NIC) keeps it.
+fn is_host_local_virtual(sysfs_net: &Path, name: &str, is_default_route: bool) -> bool {
+    !is_default_route && (name.starts_with("veth") || sysfs_net.join(name).join("bridge").is_dir())
+}
+
 /// Enumerates the host's interfaces and applies [`select_multicast_candidate_v4s`].
 ///
 /// This is the only part of the multicast policy that touches the OS, and
@@ -700,11 +717,7 @@ fn host_multicast_candidate_v4s() -> Vec<Ipv4Addr> {
             loopback: iface.is_loopback(),
             tunnel: iface.is_tun()
                 || iface.if_type == netdev::interface::types::InterfaceType::Tunnel,
-            virtual_: iface.if_type == netdev::interface::types::InterfaceType::Bridge
-                || iface.name.starts_with("br-")
-                || iface.name.starts_with("docker")
-                || iface.name.starts_with("veth")
-                || iface.name.starts_with("virbr"),
+            virtual_: is_host_local_virtual(Path::new(SYSFS_NET), &iface.name, iface.default),
             ipv4: iface.ipv4.iter().map(|net| net.addr()).collect(),
         }
     }))
@@ -1011,6 +1024,27 @@ mod tests {
                 select_multicast_candidate_v4s([multi]),
                 ips(&["192.0.2.10", "192.0.2.11"])
             );
+        }
+
+        #[test]
+        fn bridges_are_recognised_by_the_kernel_not_by_their_name() {
+            use std::path::Path;
+
+            use super::super::is_host_local_virtual;
+
+            let root = std::env::temp_dir().join(format!("mdns-sysfs-{}", std::process::id()));
+            for name in ["docker0", "lxcbr0", "virbr0", "br0"] {
+                std::fs::create_dir_all(root.join(name).join("bridge")).unwrap();
+            }
+            std::fs::create_dir_all(root.join("eth0")).unwrap();
+            let check = |name, default| is_host_local_virtual(Path::new(&root), name, default);
+            for name in ["docker0", "lxcbr0", "virbr0", "veth8c0b68e"] {
+                assert!(check(name, false), "{name}");
+            }
+            assert!(!check("eth0", false));
+            assert!(!check("br-lan", false), "a name is not a bridge");
+            assert!(!check("br0", true), "an uplink bridge is kept");
+            std::fs::remove_dir_all(&root).ok();
         }
 
         #[test]
