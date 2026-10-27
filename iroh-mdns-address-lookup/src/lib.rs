@@ -76,7 +76,10 @@ use n0_future::{
 };
 use n0_watcher::{Watchable, Watcher as _};
 use swarm_discovery::{Discoverer, DropGuard, IpClass, Peer};
-use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::{
+    mpsc::{self, error::TrySendError},
+    oneshot,
+};
 use tracing::{Instrument, debug, error, info_span, trace, warn};
 
 /// The n0 local service name.
@@ -117,7 +120,12 @@ enum Message {
         mpsc::Sender<Result<AddressLookupItem, AddressLookupError>>,
     ),
     Timeout(EndpointId, usize),
-    Subscribe(mpsc::Sender<DiscoveryEvent>),
+    /// Register a live subscriber; the reply carries one
+    /// [`DiscoveryEvent::Discovered`] per endpoint already known.
+    Subscribe(
+        mpsc::Sender<DiscoveryEvent>,
+        oneshot::Sender<Vec<DiscoveryEvent>>,
+    ),
 }
 
 /// Manages the list of subscribers that are subscribed to this Address Lookup.
@@ -129,33 +137,8 @@ impl Subscribers {
         Self(vec![])
     }
 
-    /// Add the subscriber to the list of subscribers, first replaying every
-    /// endpoint already known as a [`DiscoveryEvent::Discovered`].
-    ///
-    /// Unchanged re-announcements are deduplicated (see [`cache_discovery`]),
-    /// so an endpoint discovered before this subscriber joined would
-    /// otherwise never be reported to it: the replay is the only way a late
-    /// subscriber learns about it.
-    fn push<'a>(
-        &mut self,
-        subscriber: mpsc::Sender<DiscoveryEvent>,
-        known: impl IntoIterator<Item = &'a AddressLookupItem>,
-    ) {
-        for item in known {
-            let event = DiscoveryEvent::Discovered {
-                endpoint_info: item.endpoint_info().clone(),
-                last_updated: item.last_updated(),
-            };
-            if let Err(err) = subscriber.try_send(event) {
-                match err {
-                    TrySendError::Full(event) => {
-                        warn!(?event, "mdns subscriber is blocked, dropping replayed item")
-                    }
-                    // Dropped before it was registered: nothing to keep.
-                    TrySendError::Closed(_) => return,
-                }
-            }
-        }
+    /// Add the subscriber to the list of subscribers.
+    fn push(&mut self, subscriber: mpsc::Sender<DiscoveryEvent>) {
         self.0.push(subscriber);
     }
 
@@ -490,9 +473,16 @@ impl MdnsAddressLookup {
                             }
                         }
                     }
-                    Message::Subscribe(subscriber) => {
+                    Message::Subscribe(subscriber, known) => {
                         trace!("Mdns Message::Subscribe");
-                        subscribers.push(subscriber, endpoint_addrs.values());
+                        // Unchanged re-announcements are not reported again
+                        // (see `cache_discovery`), so this snapshot is the
+                        // only way a late subscriber learns of an endpoint
+                        // discovered before it joined.  Taken in the same
+                        // actor step that registers it: no event falls
+                        // between the two.
+                        known.send(known_endpoints(&endpoint_addrs)).ok();
+                        subscribers.push(subscriber);
                     }
                 }
             }
@@ -508,14 +498,23 @@ impl MdnsAddressLookup {
     }
 
     /// Subscribe to discovered endpoints.
+    ///
+    /// The stream first yields a [`DiscoveryEvent::Discovered`] for every
+    /// endpoint already known, then live events.
     pub async fn subscribe(&self) -> impl Stream<Item = DiscoveryEvent> + Unpin + use<> {
         let (sender, recv) = mpsc::channel(20);
+        let (known_tx, known_rx) = oneshot::channel();
         let address_lookup_sender = self.sender.clone();
         address_lookup_sender
-            .send(Message::Subscribe(sender))
+            .send(Message::Subscribe(sender, known_tx))
             .await
             .ok();
-        tokio_stream::wrappers::ReceiverStream::new(recv)
+        // An actor that has stopped knows nothing more to report.
+        let known = known_rx.await.unwrap_or_default();
+        tokio_stream::StreamExt::chain(
+            tokio_stream::iter(known),
+            tokio_stream::wrappers::ReceiverStream::new(recv),
+        )
     }
 
     fn spawn_discoverer(
@@ -605,6 +604,17 @@ fn lookup_duration(cadence: Duration) -> Duration {
             .saturating_add(cadence / 5)
             .saturating_add(Duration::from_secs(5)),
     )
+}
+
+/// One [`DiscoveryEvent::Discovered`] per endpoint in the address book.
+fn known_endpoints(cache: &HashMap<PublicKey, AddressLookupItem>) -> Vec<DiscoveryEvent> {
+    cache
+        .values()
+        .map(|item| DiscoveryEvent::Discovered {
+            endpoint_info: item.endpoint_info().clone(),
+            last_updated: item.last_updated(),
+        })
+        .collect()
 }
 
 /// Caches the latest discovery item for an endpoint.
@@ -796,56 +806,28 @@ mod tests {
     }
 
     #[test]
-    fn late_subscriber_receives_already_known_endpoints() {
-        let item = |seed| {
+    fn every_cached_endpoint_is_reported_to_a_new_subscriber() {
+        // More than a subscriber channel's capacity (20).
+        let mut cache = HashMap::new();
+        for seed in 0..30u8 {
             let id = iroh_base::SecretKey::from_bytes(&[seed; 32]).public();
-            let data = EndpointData::from_iter([iroh_base::TransportAddr::Ip(
-                ([192, 0, 2, seed], 1234).into(),
-            )]);
-            AddressLookupItem::new(EndpointInfo::from_parts(id, data), NAME, None)
-        };
-        let mut cache = HashMap::new();
-        assert!(cache_discovery(&mut cache, item(1)));
-        assert!(cache_discovery(&mut cache, item(2)));
-        // A refresh arriving before anyone subscribed is suppressed...
-        assert!(!cache_discovery(&mut cache, item(1)));
-
-        // ...so the subscriber joining now must learn both from the replay.
-        let mut subscribers = Subscribers::new();
-        let (sender, mut recv) = mpsc::channel(20);
-        subscribers.push(sender, cache.values());
-        let mut got = std::collections::BTreeMap::new();
-        while let Ok(event) = recv.try_recv() {
-            let DiscoveryEvent::Discovered { endpoint_info, .. } = event else {
-                panic!("unexpected event {event:?}");
-            };
-            got.insert(endpoint_info.endpoint_id, endpoint_info);
+            cache_discovery(
+                &mut cache,
+                AddressLookupItem::new(
+                    EndpointInfo::from_parts(id, EndpointData::default()),
+                    NAME,
+                    None,
+                ),
+            );
         }
-        let expected: std::collections::BTreeMap<_, _> = [item(1), item(2)]
-            .iter()
-            .map(|i| (i.endpoint_id(), i.endpoint_info().clone()))
+        let reported: BTreeSet<_> = known_endpoints(&cache)
+            .into_iter()
+            .map(|event| match event {
+                DiscoveryEvent::Discovered { endpoint_info, .. } => endpoint_info.endpoint_id,
+                other => panic!("unexpected {other:?}"),
+            })
             .collect();
-        assert_eq!(got, expected);
-        assert_eq!(subscribers.0.len(), 1);
-    }
-
-    #[test]
-    fn subscriber_dropped_before_registration_is_not_kept() {
-        let mut cache = HashMap::new();
-        let id = iroh_base::SecretKey::from_bytes(&[3; 32]).public();
-        cache_discovery(
-            &mut cache,
-            AddressLookupItem::new(
-                EndpointInfo::from_parts(id, EndpointData::default()),
-                NAME,
-                None,
-            ),
-        );
-        let mut subscribers = Subscribers::new();
-        let (sender, recv) = mpsc::channel(20);
-        drop(recv);
-        subscribers.push(sender, cache.values());
-        assert!(subscribers.0.is_empty());
+        assert_eq!(reported, cache.keys().copied().collect());
     }
 
     #[test]
@@ -1236,6 +1218,45 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), test)
                 .await
                 .std_context("timeout")?
+        }
+
+        /// Unchanged re-announcements are not reported again, so an endpoint
+        /// discovered before a subscriber joined must still reach it.
+        #[tokio::test]
+        #[traced_test]
+        async fn late_subscriber_learns_already_known_endpoints() -> Result {
+            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+            let (_, address_lookup_a) = make_address_lookup(&mut rng, false)?;
+            let (endpoint_id_b, address_lookup_b) = make_address_lookup(&mut rng, true)?;
+            address_lookup_b.publish(&EndpointData::from_iter([TransportAddr::Ip(
+                "0.0.0.0:11111".parse().unwrap(),
+            )]));
+
+            async fn wait_for(
+                events: &mut (impl Stream<Item = DiscoveryEvent> + Unpin),
+                id: EndpointId,
+            ) {
+                while let Some(event) = events.next().await {
+                    if let DiscoveryEvent::Discovered { endpoint_info, .. } = event
+                        && endpoint_info.endpoint_id == id
+                    {
+                        return;
+                    }
+                }
+                panic!("subscription ended before {id} was reported");
+            }
+
+            let mut early = address_lookup_a.subscribe().await;
+            tokio::time::timeout(Duration::from_secs(5), wait_for(&mut early, endpoint_id_b))
+                .await
+                .std_context("early subscriber never saw b")?;
+
+            // b keeps announcing the same addresses from now on.
+            let mut late = address_lookup_a.subscribe().await;
+            tokio::time::timeout(Duration::from_secs(3), wait_for(&mut late, endpoint_id_b))
+                .await
+                .std_context("late subscriber was never told about b")?;
+            Ok(())
         }
 
         #[tokio::test]
