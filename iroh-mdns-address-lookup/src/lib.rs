@@ -129,8 +129,33 @@ impl Subscribers {
         Self(vec![])
     }
 
-    /// Add the subscriber to the list of subscribers.
-    fn push(&mut self, subscriber: mpsc::Sender<DiscoveryEvent>) {
+    /// Add the subscriber to the list of subscribers, first replaying every
+    /// endpoint already known as a [`DiscoveryEvent::Discovered`].
+    ///
+    /// Unchanged re-announcements are deduplicated (see [`cache_discovery`]),
+    /// so an endpoint discovered before this subscriber joined would
+    /// otherwise never be reported to it: the replay is the only way a late
+    /// subscriber learns about it.
+    fn push<'a>(
+        &mut self,
+        subscriber: mpsc::Sender<DiscoveryEvent>,
+        known: impl IntoIterator<Item = &'a AddressLookupItem>,
+    ) {
+        for item in known {
+            let event = DiscoveryEvent::Discovered {
+                endpoint_info: item.endpoint_info().clone(),
+                last_updated: item.last_updated(),
+            };
+            if let Err(err) = subscriber.try_send(event) {
+                match err {
+                    TrySendError::Full(event) => {
+                        warn!(?event, "mdns subscriber is blocked, dropping replayed item")
+                    }
+                    // Dropped before it was registered: nothing to keep.
+                    TrySendError::Closed(_) => return,
+                }
+            }
+        }
         self.0.push(subscriber);
     }
 
@@ -467,7 +492,7 @@ impl MdnsAddressLookup {
                     }
                     Message::Subscribe(subscriber) => {
                         trace!("Mdns Message::Subscribe");
-                        subscribers.push(subscriber);
+                        subscribers.push(subscriber, endpoint_addrs.values());
                     }
                 }
             }
@@ -768,6 +793,59 @@ mod tests {
         // Expiry forgets the record, so the same peer is announced on return.
         cache.remove(&id);
         assert!(cache_discovery(&mut cache, make(5678)));
+    }
+
+    #[test]
+    fn late_subscriber_receives_already_known_endpoints() {
+        let item = |seed| {
+            let id = iroh_base::SecretKey::from_bytes(&[seed; 32]).public();
+            let data = EndpointData::from_iter([iroh_base::TransportAddr::Ip(
+                ([192, 0, 2, seed], 1234).into(),
+            )]);
+            AddressLookupItem::new(EndpointInfo::from_parts(id, data), NAME, None)
+        };
+        let mut cache = HashMap::new();
+        assert!(cache_discovery(&mut cache, item(1)));
+        assert!(cache_discovery(&mut cache, item(2)));
+        // A refresh arriving before anyone subscribed is suppressed...
+        assert!(!cache_discovery(&mut cache, item(1)));
+
+        // ...so the subscriber joining now must learn both from the replay.
+        let mut subscribers = Subscribers::new();
+        let (sender, mut recv) = mpsc::channel(20);
+        subscribers.push(sender, cache.values());
+        let mut got = std::collections::BTreeMap::new();
+        while let Ok(event) = recv.try_recv() {
+            let DiscoveryEvent::Discovered { endpoint_info, .. } = event else {
+                panic!("unexpected event {event:?}");
+            };
+            got.insert(endpoint_info.endpoint_id, endpoint_info);
+        }
+        let expected: std::collections::BTreeMap<_, _> = [item(1), item(2)]
+            .iter()
+            .map(|i| (i.endpoint_id(), i.endpoint_info().clone()))
+            .collect();
+        assert_eq!(got, expected);
+        assert_eq!(subscribers.0.len(), 1);
+    }
+
+    #[test]
+    fn subscriber_dropped_before_registration_is_not_kept() {
+        let mut cache = HashMap::new();
+        let id = iroh_base::SecretKey::from_bytes(&[3; 32]).public();
+        cache_discovery(
+            &mut cache,
+            AddressLookupItem::new(
+                EndpointInfo::from_parts(id, EndpointData::default()),
+                NAME,
+                None,
+            ),
+        );
+        let mut subscribers = Subscribers::new();
+        let (sender, recv) = mpsc::channel(20);
+        drop(recv);
+        subscribers.push(sender, cache.values());
+        assert!(subscribers.0.is_empty());
     }
 
     #[test]
